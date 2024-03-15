@@ -17,7 +17,19 @@ fn main() -> io::Result<()>{
                 let src = p.source_addr();
                 let des = p.destination_addr();
                 let proto = p.protocol();
-                eprintln!("{} -> {} {:?}b of protocol {:?}", src, des, p.payload_len(), proto);
+                // 0x64 is tcp
+                if proto != etherparse::IpNumber::TCP  {
+                    // not tcp
+                    continue;
+                }
+                match etherparse::TcpHeaderSlice::from_slice(&buf[4+p.slice().len()..]) {
+                    Ok(p) => {
+                        eprintln!("{} -> {} {:?}b of tcp to port {:?}", src, des, p.slice().len(), p.destination_port());
+                    },
+                    Err(e) => {
+                        eprintln!("ignoring weird tcp packets {:?}",e);
+                    }
+                }
             },
             Err(e) => {
                 eprintln!("ignoring packets {:?}", e);
@@ -25,5 +37,4 @@ fn main() -> io::Result<()>{
         }
         eprintln!("read {} bytes (flags: {:x} , proto: {:x}) : {:x?}", nbytes - 4, eth_flags, eth_proto, &buf[4..nbytes]);
     }
-    Ok(())
 }
