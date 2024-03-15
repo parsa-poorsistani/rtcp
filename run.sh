@@ -1,7 +1,7 @@
 #!/bin/bash
 cargo build --release
 ext=$?
-echo "$ext"
+echo "test"
 if [[ $ext -ne 0 ]]; then
   exit $ext
 fi
