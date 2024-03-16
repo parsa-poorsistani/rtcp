@@ -72,13 +72,11 @@ impl Connection {
         data: &'a [u8],
     ) -> io::Result<Option<Self>> {
         let mut buf = [0u8; 1500];
-
         if !tcph.syn() {
             // only SYN packet expected
             return Ok(None);
         }
-        eprintln!("source is: {}", iph.source_addr());
-        let iss = 0u32;
+        let iss = 0;
         let mut c = Connection {
             state: State::SyncRcvd,
             send: SendSequenceSpace {
@@ -125,6 +123,9 @@ impl Connection {
             ],
         )
         .unwrap();
+
+        // had to calculate checksum, kernel does not do this(WTF?)
+        syn_ack.checksum = syn_ack.calc_checksum_ipv4(&ip, &[]).expect("Failed");
         let unwritten = {
             let mut unwritten = &mut buf[..];
             ip.write(&mut unwritten);

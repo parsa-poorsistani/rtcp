@@ -16,11 +16,6 @@ fn main() -> io::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
         let nbytes = nic.recv(&mut buf[..])?;
-        //        let eth_proto = u16::from_be_bytes([buf[2], buf[3]]);
-        //        if eth_proto != 0x0800 {
-        // not IPV4
-        //          continue;
-        //    }
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
             Ok(iph) => {
                 let src = iph.source_addr();
