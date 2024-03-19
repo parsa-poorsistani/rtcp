@@ -283,21 +283,24 @@ impl Connection {
                 return Ok(());
             }
         }*/
-        if !self.state.is_synchorized() {
+        /*if self.state.is_synchorized() {
+            eprintln!("here maybe");
             // based on the Reset Generation
             self.send.nxt = tcph.acknowledgment_number();
             self.send_rst(nic);
 
             return Ok(());
-        }
+        }*/
 
         let ackn = tcph.acknowledgment_number();
         if let State::SyncRcvd = self.state {
-            if !is_between_wrapped(
+            eprintln!("sync");
+            if is_between_wrapped(
                 self.send.una.wrapping_sub(1),
                 ackn,
                 self.send.nxt.wrapping_add(1),
             ) {
+                eprintln!("else sync");
                 // must have ACKed our syn since we detected at least one ACKed byte, and we have
                 // only sent one byte (the SYN)
                 self.state = State::Estab;
@@ -310,7 +313,8 @@ impl Connection {
                  return Ok(());
              }
         */
-        if let State::Estab = self.state {
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            eprintln!("here");
             if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 return Ok(());
             }
@@ -319,12 +323,16 @@ impl Connection {
             assert!(data.is_empty());
             // now let's terminate the connection
             // TODO : needs to be stored in the retransmission queue
-            self.tcp.fin = true;
-            self.write(nic, &[])?;
-            self.state = State::FinWait1;
+            if let State::Estab = self.state {
+                self.tcp.fin = true;
+                self.write(nic, &[])?;
+                self.state = State::FinWait1;
+            }
         }
         if let State::FinWait1 = self.state {
+            eprintln!("wait");
             if self.send.una == self.send.iss + 2 {
+                eprintln!("wait1 if");
                 //our FIN has been ACKed
                 self.state = State::FinWait2;
             }
@@ -332,6 +340,7 @@ impl Connection {
         if tcph.fin() {
             match self.state {
                 State::FinWait2 => {
+                    eprintln!("wait2");
                     // we're done with the connection!
                     self.write(nic, &[])?;
                     self.state = State::TimeWait;
