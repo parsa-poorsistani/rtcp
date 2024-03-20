@@ -5,7 +5,7 @@ use std::{io, u16};
 mod tcp;
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq)]
-struct Quad {
+pub struct Quad {
     src: (Ipv4Addr, u16),
     dst: (Ipv4Addr, u16),
 }
