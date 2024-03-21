@@ -1,4 +1,4 @@
-use std::{io, u8, usize};
+use std::{collections::VecDeque, io, u8, usize};
 
 pub enum State {
     //Closed,
@@ -27,6 +27,9 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
+
+    pub(crate) incoming: VecDeque<u8>,
+    pub(crate) unacked: VecDeque<u8>,
 }
 /*
   Send Sequence Space (RFC 793)
@@ -129,6 +132,8 @@ impl Connection {
             )
             .unwrap(),
             tcp: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
+            incoming: Default::default(),
+            unacked: Default::default(),
         };
 
         c.tcp.syn = true;
