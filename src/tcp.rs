@@ -319,12 +319,10 @@ impl Connection {
              }
         */
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            eprintln!("here");
-            if !is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
-                return Ok(());
+            if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                self.send.una = ackn;
             }
-            self.send.una = ackn;
-            // TODO
+            // TODO: accept data
             assert!(data.is_empty());
             // now let's terminate the connection
             // TODO : needs to be stored in the retransmission queue
