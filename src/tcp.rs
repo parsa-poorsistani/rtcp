@@ -1,5 +1,14 @@
 use std::{collections::VecDeque, io, u8, usize};
 
+use bitflags::bitflags;
+
+bitflags! {
+    pub(crate) struct Available: u8 {
+    const READ = 0b00000001;
+    const WRITE = 0b00000010;
+    }
+}
+
 pub enum State {
     //Closed,
     //Listen,
@@ -30,6 +39,26 @@ pub struct Connection {
 
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+}
+
+impl Connection {
+    pub(crate) fn is_rcv_closed(&self) -> bool {
+        if let State::TimeWait = self.state {
+            // TODO:any state after rvc FIN, so also CLOSE-WAIT, LAST-ACK, CLOSED, CLOSING
+            true
+        } else {
+            false
+        }
+    }
+
+    fn availability(&self) -> Available {
+        let mut a = Available::empty();
+        if self.is_rcv_closed() || !self.incoming.is_empty() {
+            a |= Available::READ;
+        }
+        // TODO: set Available::Write
+        a
+    }
 }
 /*
   Send Sequence Space (RFC 793)
@@ -201,13 +230,13 @@ impl Connection {
         Ok(())
     }
 
-    pub fn on_packet<'a>(
+    pub(crate) fn on_packet<'a>(
         &mut self,
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> io::Result<()> {
+    ) -> io::Result<Available> {
         //valid seq numb check
         // valid segment check. okay if it acks at least one byte, which means that at least one of
         // the following is true:
@@ -267,14 +296,14 @@ impl Connection {
         };
         if !okay {
             self.write(nic, &[]);
-            return Ok(());
+            return Ok(self.availability());
         }
         self.recv.nxt = seqn.wrapping_add(slen);
         // TODO: if not acceptable send ACK
         // // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcph.ack() {
-            return Ok(());
+            return Ok(self.availability());
         }
         // SND.UNA < SEG.ACK =< SND.NXT
         // remeber wrapping
@@ -351,7 +380,7 @@ impl Connection {
                 _ => unimplemented!(),
             }
         }
-        Ok(())
+        Ok(self.availability())
     }
 }
 fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
