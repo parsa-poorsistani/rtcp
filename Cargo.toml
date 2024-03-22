@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 tun-tap = "0.1.2"
 etherparse = "0.14"
+bitflags = "1.0"
 
 [lib]
 name = "rtcp"
