@@ -75,7 +75,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                         use std::collections::hash_map::Entry;
                         let datai = iph.slice().len() + tcph.slice().len();
                         let mut cmg = ih.manager.lock().unwrap();
-                        let mut cm = &mut *cmg;
+                        let cm = &mut *cmg;
                         let q = Quad {
                             src: (src, tcph.source_port()),
                             dst: (dst, tcph.destination_port()),
