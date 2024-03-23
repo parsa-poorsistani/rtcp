@@ -7,8 +7,17 @@ fn main() -> io::Result<()> {
     let jh1 = thread::spawn(move || {
         while let Ok(mut stream) = l1.accept() {
             eprintln!("got connection on 9000");
-            let n = stream.read(&mut [0]).unwrap();
-            assert_eq!(n, 0);
+            loop {
+                let mut buf = [0; 512];
+                let n = stream.read(&mut buf[..]).unwrap();
+                eprintln!("read {}b of data", n);
+                if n == 0 {
+                    eprintln!("no more data");
+                    break;
+                } else {
+                    println!("{}", std::str::from_utf8(&buf[..n]).unwrap());
+                }
+            }
         }
     });
     jh1.join().unwrap();

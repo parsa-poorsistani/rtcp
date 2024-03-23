@@ -1,4 +1,8 @@
-use std::{collections::VecDeque, io, u8, usize};
+use std::{
+    collections::VecDeque,
+    io::{self, Write},
+    u8, usize,
+};
 
 use bitflags::bitflags;
 
@@ -298,11 +302,14 @@ impl Connection {
             self.write(nic, &[]);
             return Ok(self.availability());
         }
-        self.recv.nxt = seqn.wrapping_add(slen);
         // TODO: if not acceptable send ACK
         // // <SEQ=SND.NXT><ACK=RCV.NXT><CTL=ACK>
 
         if !tcph.ack() {
+            if tcph.syn() {
+                assert!(data.is_empty());
+                self.recv.nxt = seqn.wrapping_add(1);
+            }
             return Ok(self.availability());
         }
         // SND.UNA < SEG.ACK =< SND.NXT
@@ -351,13 +358,13 @@ impl Connection {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 self.send.una = ackn;
             }
-            // TODO: accept data
-            assert!(data.is_empty());
-            // now let's terminate the connection
-            // TODO : needs to be stored in the retransmission queue
+            // TODO: prune self.unacked
+            // TODO: if unacked empty and waiting flush, notify
+            // TODO: update window
             if let State::Estab = self.state {
+                // TODO : needs to be stored in the retransmission queue
                 self.tcp.fin = true;
-                self.write(nic, &[])?;
+                //    self.write(nic, &[])?;
                 self.state = State::FinWait1;
             }
         }
@@ -369,6 +376,20 @@ impl Connection {
                 self.state = State::FinWait2;
             }
         }
+        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
+            if unread_data_at > data.len() {
+                assert_eq!(unread_data_at, data.len() + 1);
+                unread_data_at = 0;
+            }
+            self.incoming.extend(&data[unread_data_at..]);
+            self.recv.nxt = seqn
+                .wrapping_add(data.len() as u32)
+                .wrapping_add(if tcph.fin() { 1 } else { 0 });
+
+            self.write(nic, &[])?;
+        }
+
         if tcph.fin() {
             match self.state {
                 State::FinWait2 => {
@@ -383,6 +404,7 @@ impl Connection {
         Ok(self.availability())
     }
 }
+
 fn wrapping_lt(lhs: u32, rhs: u32) -> bool {
     // TCP determines if a data segment is "old" or "new" by testing
     //   whether its sequence number is within 2**31 bytes of the left edge
