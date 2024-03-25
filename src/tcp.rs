@@ -185,14 +185,14 @@ impl Connection {
 
         c.tcp.syn = true;
         c.tcp.ack = true;
-        c.write(nic, &[]);
+        c.write(nic, c.send.nxt, &[]);
 
         Ok(Some(c))
     }
 
-    fn write(&mut self, nic: &mut tun_tap::Iface, payload: &[u8]) -> io::Result<usize> {
+    fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, payload: &[u8]) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
-        self.tcp.sequence_number = self.send.nxt;
+        self.tcp.sequence_number = seq;
         let size = std::cmp::min(
             buf.len(),
             self.tcp.header_len() + self.ip.header_len() as usize + payload.len(),
@@ -210,16 +210,22 @@ impl Connection {
         self.tcp.write(&mut unwritten);
         let payload_bytes = unwritten.write(payload)?;
         let unwritten = unwritten.len();
+        let next_seq = seq.wrapping_add(payload_bytes as u32);
 
-        self.send.nxt.wrapping_add(payload_bytes as u32);
         if self.tcp.syn {
             self.send.nxt = self.send.nxt.wrapping_add(1);
             self.tcp.syn = false;
         }
+
         if self.tcp.fin {
             self.send.nxt = self.send.nxt.wrapping_add(1);
             self.tcp.fin = false;
         }
+
+        if wrapping_lt(self.send.nxt, next_seq) {
+            self.send.nxt = next_seq;
+        }
+
         nic.send(&buf[..buf.len() - unwritten]);
         Ok(payload_bytes)
     }
@@ -243,7 +249,7 @@ impl Connection {
         //      to be received, and the connection remains in the same state.
         self.tcp.sequence_number = 0;
         self.tcp.acknowledgment_number = 0;
-        self.write(nic, &[]);
+        self.write(nic, self.send.nxt, &[]);
         Ok(())
     }
 
@@ -251,13 +257,13 @@ impl Connection {
         //decide if it needs to send something
         //send it
         let nunacked = self.send.nxt.wrapping_sub(self.send.una);
-        let unsent = self.unacked.len() - unacked as usize;
+        let unsent = self.unacked.len() - nunacked as usize;
 
         let waited_for = self.timers.last_send.elapsed();
         if waited_for > time::Duration::from_secs(1) && waited_for > 1.5 * self.timers.srtt {
             // we should retransmit
             let resend = std::cmp::min(self.unacked.len(), self.send.wnd);
-            self.write(nic, &self.unacked[..resend])?;
+            self.write(nic, self.send.una, &self.unacked[..resend])?;
             self.send.nxt = self.send.una.wrapping_add(self.send.wnd);
         } else {
             // we should send new data, and space in the window
@@ -270,8 +276,12 @@ impl Connection {
                 return Ok(());
             }
 
-            self.write(nic, &self.unacked[nunacked..(nunacked + allowed)])?;
-            self.send.nxt += allowed;
+            let send = std::cmp::min(unsent, allowed);
+            self.write(
+                nic,
+                self.send.nxt,
+                &self.unacked[nunacked..(nunacked + send)],
+            )?;
         }
     }
 
@@ -340,7 +350,7 @@ impl Connection {
             }
         };
         if !okay {
-            self.write(nic, &[]);
+            self.write(nic, self.send.nxt, &[]);
             return Ok(self.availability());
         }
         // TODO: if not acceptable send ACK
@@ -428,7 +438,8 @@ impl Connection {
                 .wrapping_add(data.len() as u32)
                 .wrapping_add(if tcph.fin() { 1 } else { 0 });
 
-            self.write(nic, &[])?;
+            // TODO: mabye just tick topiggyback on data
+            self.write(nic, self.send.nxt, &[])?;
         }
 
         if tcph.fin() {
@@ -436,7 +447,7 @@ impl Connection {
                 State::FinWait2 => {
                     eprintln!("wait2");
                     // we're done with the connection!
-                    self.write(nic, &[])?;
+                    self.write(nic, self.send.nxt, &[])?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
