@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     io::{self, Write},
-    u8, usize,
+    time, u8, usize,
 };
 
 use bitflags::bitflags;
@@ -40,9 +40,17 @@ pub struct Connection {
     recv: RecvSequenceSpace,
     ip: etherparse::Ipv4Header,
     tcp: etherparse::TcpHeader,
+    timers: Timers,
 
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
+    pub(crate) closed: bool,
+}
+
+struct Timers {
+    send_times: VecDeque<(u32, time::Instant)>,
+    last_send: time::Instant,
+    srtt: time::Duration,
 }
 
 impl Connection {
@@ -130,6 +138,12 @@ impl Connection {
         let iss = 0;
         let wnd = 10;
         let mut c = Connection {
+            timers: Timers {
+                last_send: time::Instant::now(),
+                send_times: Default::default(),
+                srtt: time::Duration::from_secs(2 * 60),
+            },
+            closed: false,
             state: State::SyncRcvd,
             send: SendSequenceSpace {
                 iss,
@@ -191,7 +205,6 @@ impl Connection {
         self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[]).expect("Failed");
 
         //write out th headers
-        use std::io::Write;
         let mut unwritten = &mut buf[..];
         self.ip.write(&mut unwritten);
         self.tcp.write(&mut unwritten);
@@ -232,6 +245,34 @@ impl Connection {
         self.tcp.acknowledgment_number = 0;
         self.write(nic, &[]);
         Ok(())
+    }
+
+    pub(crate) fn on_tick<'a>(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
+        //decide if it needs to send something
+        //send it
+        let nunacked = self.send.nxt.wrapping_sub(self.send.una);
+        let unsent = self.unacked.len() - unacked as usize;
+
+        let waited_for = self.timers.last_send.elapsed();
+        if waited_for > time::Duration::from_secs(1) && waited_for > 1.5 * self.timers.srtt {
+            // we should retransmit
+            let resend = std::cmp::min(self.unacked.len(), self.send.wnd);
+            self.write(nic, &self.unacked[..resend])?;
+            self.send.nxt = self.send.una.wrapping_add(self.send.wnd);
+        } else {
+            // we should send new data, and space in the window
+            if unsent == 0 {
+                return Ok(());
+            }
+
+            let allowed = self.send.wnd - nunacked;
+            if allowed == 0 {
+                return Ok(());
+            }
+
+            self.write(nic, &self.unacked[nunacked..(nunacked + allowed)])?;
+            self.send.nxt += allowed;
+        }
     }
 
     pub(crate) fn on_packet<'a>(

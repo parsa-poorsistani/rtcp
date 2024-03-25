@@ -59,6 +59,26 @@ struct ConnectionManager {
 fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
     let mut buf = [0u8; 1504];
     loop {
+        //we want to read from the nic, but we want to make sure that we'll wake up when the next
+        //timer has to be triggered
+        use std::os::unix::io::AsRawFd;
+        let mut pfd = [nix::poll::PollFd::new(
+            nic.as_raw_fd(),
+            nix::poll::EventFlags::POLLIN,
+        )];
+        // poll must be changed to epoll(or anything else)
+        // nix crate is so old and must changed
+        let n = nix::poll::poll(&mut pfd[..], 1).map_err(|e| e.as_errno().unwrap())?;
+        assert_ne!(n, -1);
+        if n == 0 {
+            let mut cmg = ih.manager.lock().unwrap();
+            for connection in cmg.values() {
+                // TODO: don't die on errors
+                connection.on_tick(&mut nic);
+            }
+            continue;
+        }
+        assert_eq!(1, n);
         // TODO: set timeout for this recv for TCP timers or ConnectionManager::terminate
         let nbytes = nic.recv(&mut buf[..])?;
         match etherparse::Ipv4HeaderSlice::from_slice(&buf[..nbytes]) {
@@ -137,6 +157,7 @@ impl Interface {
             let ih = ih.clone();
             thread::spawn(move || packet_loop(nic, ih))
         };
+
         Ok(Interface {
             ih: Some(ih),
             jh: Some(jh),
@@ -256,8 +277,15 @@ impl Drop for TcpStream {
 
 impl TcpStream {
     pub fn shutdown(&self, how: std::net::Shutdown) -> io::Result<()> {
-        //TODO: send FIN on cm.pending[quad]
-        unimplemented!();
+        let mut cm = self.h.manager.lock().unwrap();
+        let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "stream was terminated unexpectedly",
+            )
+        })?;
+        c.closed = true;
+        Ok(())
     }
 }
 
