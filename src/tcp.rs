@@ -32,6 +32,14 @@ impl State {
             _ => unimplemented!(),
         }
     }
+
+    fn have_sent_fin(&self) -> bool {
+        match *self {
+            State::SyncRcvd | State::Estab => false,
+            State::FinWait1 | State::TimeWait | State::FinWait2 => true,
+            _ => unimplemented!(),
+        }
+    }
 }
 
 pub struct Connection {
@@ -45,6 +53,7 @@ pub struct Connection {
     pub(crate) incoming: VecDeque<u8>,
     pub(crate) unacked: VecDeque<u8>,
     pub(crate) closed: bool,
+    closed_at: Option<u32>,
 }
 
 struct Timers {
@@ -143,7 +152,6 @@ impl Connection {
                 send_times: Default::default(),
                 srtt: time::Duration::from_secs(2 * 60),
             },
-            closed: false,
             state: State::SyncRcvd,
             send: SendSequenceSpace {
                 iss,
@@ -181,6 +189,8 @@ impl Connection {
             tcp: etherparse::TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, wnd),
             incoming: Default::default(),
             unacked: Default::default(),
+            closed_at: None,
+            closed: false,
         };
 
         c.tcp.syn = true;
@@ -190,7 +200,14 @@ impl Connection {
         Ok(Some(c))
     }
 
-    fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, payload: &[u8]) -> io::Result<usize> {
+    fn write(
+        &mut self,
+        nic: &mut tun_tap::Iface,
+        seq: u32,
+        payload1: &[u8],
+        payload2: &[u8],
+        len: usize,
+    ) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
         self.tcp.sequence_number = seq;
         let size = std::cmp::min(
@@ -257,17 +274,25 @@ impl Connection {
         //decide if it needs to send something
         //send it
         let nunacked = self.send.nxt.wrapping_sub(self.send.una);
-        let unsent = self.unacked.len() - nunacked as usize;
+        let unsent = self.unacked.len() as u32 - nunacked;
+
+        self.closed;
 
         let waited_for = self.timers.last_send.elapsed();
         if waited_for > time::Duration::from_secs(1) && waited_for > 1.5 * self.timers.srtt {
             // we should retransmit
-            let resend = std::cmp::min(self.unacked.len(), self.send.wnd);
+            let resend = std::cmp::min(self.unacked.len() as u32, self.send.wnd as u32);
+            if resend < self.send.wnd as u32 && self.closed {
+                //can we include the FIN?
+                self.tcp.fin = true;
+                // TODO: set.closed_at
+            }
+
             self.write(nic, self.send.una, &self.unacked[..resend])?;
-            self.send.nxt = self.send.una.wrapping_add(self.send.wnd);
+            self.send.nxt = self.send.una.wrapping_add(resend);
         } else {
             // we should send new data, and space in the window
-            if unsent == 0 {
+            if unsent == 0 && self.closed_at.is_some() {
                 return Ok(());
             }
 
@@ -277,6 +302,10 @@ impl Connection {
             }
 
             let send = std::cmp::min(unsent, allowed);
+            if send < allowed && self.closed && self.closed_at.is_some() {
+                self.tcp.fin = true;
+                self.closed_at = Some(self.send.nxt.wrapping_add(unsent as u32));
+            }
             self.write(
                 nic,
                 self.send.nxt,
@@ -454,6 +483,23 @@ impl Connection {
             }
         }
         Ok(self.availability())
+    }
+
+    pub fn close(&mut self) -> io::Result<()> {
+        self.closed = true;
+        match self.state {
+            State::SyncRcvd | State::Estab => {
+                self.state = State::FinWait1;
+            }
+            State::FinWait1 | State::FinWait2 => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotConnected,
+                    "already closing",
+                ))
+            }
+        }
+        Ok(())
     }
 }
 

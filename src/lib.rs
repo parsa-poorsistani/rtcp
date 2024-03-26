@@ -4,6 +4,7 @@ use std::io::{self, ErrorKind};
 use std::net::Ipv4Addr;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
+use tcp::State;
 use tun_tap::Mode;
 pub mod tcp;
 
@@ -72,7 +73,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
         assert_ne!(n, -1);
         if n == 0 {
             let mut cmg = ih.manager.lock().unwrap();
-            for connection in cmg.values() {
+            for connection in cmg.connections.values() {
                 // TODO: don't die on errors
                 connection.on_tick(&mut nic);
             }
@@ -284,8 +285,7 @@ impl TcpStream {
                 "stream was terminated unexpectedly",
             )
         })?;
-        c.closed = true;
-        Ok(())
+        c.close()
     }
 }
 
