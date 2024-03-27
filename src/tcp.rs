@@ -5,6 +5,7 @@ use std::{
 };
 
 use bitflags::bitflags;
+use nix::NixPath;
 
 bitflags! {
     pub(crate) struct Available: u8 {
@@ -195,7 +196,7 @@ impl Connection {
 
         c.tcp.syn = true;
         c.tcp.ack = true;
-        c.write(nic, c.send.nxt, &[]);
+        c.write(nic, c.send.nxt, &[], &[], 0);
 
         Ok(Some(c))
     }
@@ -206,13 +207,15 @@ impl Connection {
         seq: u32,
         payload1: &[u8],
         payload2: &[u8],
-        len: usize,
+        limit: usize,
     ) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
+        let max_data = std::cmp::min(limit, payload1.len() + payload2.len());
+
         self.tcp.sequence_number = seq;
         let size = std::cmp::min(
             buf.len(),
-            self.tcp.header_len() + self.ip.header_len() as usize + payload.len(),
+            self.tcp.header_len() + self.ip.header_len() as usize + max_data,
         );
         self.tcp.acknowledgment_number = self.recv.nxt;
         self.ip
@@ -225,7 +228,19 @@ impl Connection {
         let mut unwritten = &mut buf[..];
         self.ip.write(&mut unwritten);
         self.tcp.write(&mut unwritten);
-        let payload_bytes = unwritten.write(payload)?;
+        let payload_bytes = {
+            let mut written = 0;
+            let mut limit = max_data;
+            //first write as much as we can from p1
+            let p1l = std::cmp::min(limit, payload1.len());
+            written += unwritten.write(&payload1[..p1l])?;
+            limit -= written;
+
+            //then, write if we can from p2
+            let p2l = std::cmp::min(limit, payload2.len());
+            written += unwritten.write(&payload2[..p2l])?;
+            written
+        };
         let unwritten = unwritten.len();
         let next_seq = seq.wrapping_add(payload_bytes as u32);
 
@@ -266,7 +281,7 @@ impl Connection {
         //      to be received, and the connection remains in the same state.
         self.tcp.sequence_number = 0;
         self.tcp.acknowledgment_number = 0;
-        self.write(nic, self.send.nxt, &[]);
+        self.write(nic, self.send.nxt, &[], &[], 0);
         Ok(())
     }
 
@@ -288,8 +303,8 @@ impl Connection {
                 // TODO: set.closed_at
             }
 
-            self.write(nic, self.send.una, &self.unacked[..resend])?;
-            self.send.nxt = self.send.una.wrapping_add(resend);
+            let (h, t) = self.unacked.as_slices();
+            self.write(nic, self.send.una, h, t, 0)?;
         } else {
             // we should send new data, and space in the window
             if unsent == 0 && self.closed_at.is_some() {
@@ -306,12 +321,19 @@ impl Connection {
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.nxt.wrapping_add(unsent as u32));
             }
-            self.write(
-                nic,
-                self.send.nxt,
-                &self.unacked[nunacked..(nunacked + send)],
-            )?;
+
+            let (mut h, mut t) = self.unacked.as_slices();
+            // we want self.unacked[nunacked..]
+            if h.len() >= nunacked {
+                h = &h[nunacked..];
+            } else {
+                let skipped = h.len();
+                h = &[];
+                t = &t[(nunacked - skipped)..];
+            }
+            self.write(nic, self.send.nxt, h, t, send as usize)?;
         }
+        Ok(())
     }
 
     pub(crate) fn on_packet<'a>(
@@ -379,7 +401,7 @@ impl Connection {
             }
         };
         if !okay {
-            self.write(nic, self.send.nxt, &[]);
+            self.write(nic, self.send.nxt, &[], &[], 0);
             return Ok(self.availability());
         }
         // TODO: if not acceptable send ACK
@@ -468,7 +490,7 @@ impl Connection {
                 .wrapping_add(if tcph.fin() { 1 } else { 0 });
 
             // TODO: mabye just tick topiggyback on data
-            self.write(nic, self.send.nxt, &[])?;
+            self.write(nic, self.send.nxt, &[], &[], 0)?;
         }
 
         if tcph.fin() {
@@ -476,7 +498,7 @@ impl Connection {
                 State::FinWait2 => {
                     eprintln!("wait2");
                     // we're done with the connection!
-                    self.write(nic, self.send.nxt, &[])?;
+                    self.write(nic, self.send.nxt, &[], &[], 0)?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
