@@ -73,7 +73,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
         assert_ne!(n, -1);
         if n == 0 {
             let mut cmg = ih.manager.lock().unwrap();
-            for connection in cmg.connections.values() {
+            for connection in cmg.connections.values_mut() {
                 // TODO: don't die on errors
                 connection.on_tick(&mut nic);
             }
@@ -270,7 +270,7 @@ impl Write for TcpStream {
 }
 impl Drop for TcpStream {
     fn drop(&mut self) {
-        let mut cm = self.h.manager.lock().unwrap();
+        let cm = self.h.manager.lock().unwrap();
         //TODO: _eventually_ remove sele.quad from cm.connections
         //TODO: send FIN on cm.pending[quad]
     }
