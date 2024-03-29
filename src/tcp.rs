@@ -59,7 +59,7 @@ pub struct Connection {
 
 struct Timers {
     send_times: BTreeMap<u32, time::Instant>,
-    srtt: time::Duration,
+    srtt: f64,
 }
 
 impl Connection {
@@ -138,7 +138,7 @@ impl Connection {
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
-        data: &'a [u8],
+        // commenting for now        data: &'a [u8],
     ) -> io::Result<Option<Self>> {
         if !tcph.syn() {
             // only SYN packet expected
@@ -149,7 +149,7 @@ impl Connection {
         let mut c = Connection {
             timers: Timers {
                 send_times: Default::default(),
-                srtt: time::Duration::from_secs(2 * 60),
+                srtt: time::Duration::from_secs(1 * 60).as_secs_f64(),
             },
             state: State::SyncRcvd,
             send: SendSequenceSpace {
@@ -194,21 +194,26 @@ impl Connection {
 
         c.tcp.syn = true;
         c.tcp.ack = true;
-        c.write(nic, c.send.nxt, 0, 0);
+        c.write(nic, c.send.nxt, 0);
 
         Ok(Some(c))
     }
 
-    fn write(
-        &mut self,
-        nic: &mut tun_tap::Iface,
-        seq: u32,
-        offset: usize,
-        limit: usize,
-    ) -> io::Result<usize> {
+    fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, mut limit: usize) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
         let (mut h, mut t) = self.unacked.as_slices();
-        // we want self.unacked[nunacked..]
+        // TODO: return +1 for SYN/FIN
+        // we need to special-case the two "virtual" bytes SYN and FIN
+        let mut offset = seq.wrapping_sub(self.send.una);
+
+        //print!()
+        if let Some(closed_at) = self.closed_at {
+            if seq == closed_at.wrapping_add(1) {
+                // trying to write the following FIN
+                offset = 0;
+                limit = 0;
+            }
+        }
         if h.len() >= offset as usize {
             h = &h[offset as usize..];
         } else {
@@ -226,13 +231,16 @@ impl Connection {
         self.tcp.acknowledgment_number = self.recv.nxt;
         self.ip
             .set_payload_len(size - self.ip.header_len() as usize);
-        // had to calculate checksum, kernel does not do this(WTF?)
 
-        self.tcp.checksum = self.tcp.calc_checksum_ipv4(&self.ip, &[]).expect("Failed");
-
+        let bufl = buf.len();
         //write out th headers
         let mut unwritten = &mut buf[..];
         self.ip.write(&mut unwritten);
+        let ip_header_ends_at = bufl - unwritten.len();
+        //postpone writing the TCP header because we need the payload as one contiguous slice to
+        //calculate the tcp checksum
+        unwritten = &mut unwritten[self.tcp.header_len() as usize..];
+        let tcp_header_ends_at = bufl - unwritten.len();
         self.tcp.write(&mut unwritten);
         let payload_bytes = {
             let mut written = 0;
@@ -247,9 +255,15 @@ impl Connection {
             written += unwritten.write(&t[..p2l])?;
             written
         };
+        let payloadh_ends_at = bufl - unwritten.len();
         let unwritten = unwritten.len();
         let next_seq = seq.wrapping_add(payload_bytes as u32);
 
+        // had to calculate checksum, kernel does not do this(WTF?)
+        self.tcp.checksum = self
+            .tcp
+            .calc_checksum_ipv4(&self.ip, &buf[tcp_header_ends_at..payloadh_ends_at])
+            .expect("Failed");
         if self.tcp.syn {
             self.send.nxt = self.send.nxt.wrapping_add(1);
             self.tcp.syn = false;
@@ -288,7 +302,7 @@ impl Connection {
         //      to be received, and the connection remains in the same state.
         self.tcp.sequence_number = 0;
         self.tcp.acknowledgment_number = 0;
-        self.write(nic, self.send.nxt, 0, 0);
+        self.write(nic, self.send.nxt, 0);
         Ok(())
     }
 
@@ -309,7 +323,7 @@ impl Connection {
 
         let should_retransmit = if let Some(waited_for) = waited_for {
             waited_for > time::Duration::from_secs(1)
-                && waited_for.as_secs_f64() > 1.5 * self.timers.srtt.as_secs_f64()
+                && waited_for.as_secs_f64() > 1.5 * self.timers.srtt
         } else {
             false
         };
@@ -322,7 +336,7 @@ impl Connection {
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32))
             }
 
-            self.write(nic, self.send.una, 0, resend as usize)?;
+            self.write(nic, self.send.una, resend as usize)?;
         } else {
             // we should send new data, and space in the window
             if unsent == 0 && self.closed_at.is_some() {
@@ -349,7 +363,7 @@ impl Connection {
                 h = &[];
                 t = &t[(nunacked as usize - skipped)..];
             }
-            self.write(nic, self.send.nxt, nunacked as usize, send as usize)?;
+            self.write(nic, self.send.nxt, send as usize)?;
         }
         // if FIN, enter FIN-WAIT-1
         Ok(())
@@ -420,7 +434,7 @@ impl Connection {
             }
         };
         if !okay {
-            self.write(nic, self.send.nxt, 0, 0);
+            self.write(nic, self.send.nxt, 0);
             return Ok(self.availability());
         }
         // TODO: if not acceptable send ACK
@@ -477,17 +491,33 @@ impl Connection {
         */
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
+                if !self.unacked.is_empty() {
+                    let nacked = self
+                        .unacked
+                        .drain(..ackn.wrapping_sub(self.send.una) as usize)
+                        .count();
+
+                    let old = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
+
+                    let una = self.send.una;
+                    let mut srtt = &mut self.timers.srtt;
+
+                    self.timers
+                        .send_times
+                        .extend(old.into_iter().filter_map(|(seq, sent)| {
+                            if is_between_wrapped(una, seq, ackn) {
+                                *srtt = 0.8 * *srtt + (1.0 - 0.8) * sent.elapsed().as_secs_f64();
+                                None
+                            } else {
+                                Some((seq, sent))
+                            }
+                        }));
+                }
                 self.send.una = ackn;
             }
             // TODO: prune self.unacked
             // TODO: if unacked empty and waiting flush, notify
             // TODO: update window
-            if let State::Estab = self.state {
-                // TODO : needs to be stored in the retransmission queue
-                self.tcp.fin = true;
-                //    self.write(nic, &[])?;
-                self.state = State::FinWait1;
-            }
         }
         if let State::FinWait1 = self.state {
             eprintln!("wait");
@@ -509,7 +539,7 @@ impl Connection {
                 .wrapping_add(if tcph.fin() { 1 } else { 0 });
 
             // TODO: mabye just tick topiggyback on data
-            self.write(nic, self.send.nxt, 0, 0)?;
+            self.write(nic, self.send.nxt, 0)?;
         }
 
         if tcph.fin() {
@@ -517,7 +547,7 @@ impl Connection {
                 State::FinWait2 => {
                     eprintln!("wait2");
                     // we're done with the connection!
-                    self.write(nic, self.send.nxt, 0, 0)?;
+                    self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
                 }
                 _ => unimplemented!(),
