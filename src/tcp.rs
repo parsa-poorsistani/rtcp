@@ -138,7 +138,7 @@ impl Connection {
         nic: &mut tun_tap::Iface,
         iph: etherparse::Ipv4HeaderSlice<'a>,
         tcph: etherparse::TcpHeaderSlice<'a>,
-        // commenting for now        data: &'a [u8],
+        data: &'a [u8],
     ) -> io::Result<Option<Self>> {
         if !tcph.syn() {
             // only SYN packet expected
@@ -307,9 +307,14 @@ impl Connection {
     }
 
     pub(crate) fn on_tick<'a>(&mut self, nic: &mut tun_tap::Iface) -> io::Result<()> {
-        //decide if it needs to send something
-        //send it
-        let nunacked = self.send.nxt.wrapping_sub(self.send.una);
+        if let State::FinWait2 | State::TimeWait = self.state {
+            return Ok(());
+        }
+
+        let nunacked = self
+            .closed_at
+            .unwrap_or(self.send.nxt)
+            .wrapping_sub(self.send.una);
         let unsent = self.unacked.len() as u32 - nunacked;
 
         self.closed;
@@ -354,15 +359,6 @@ impl Connection {
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32))
             }
 
-            let (mut h, mut t) = self.unacked.as_slices();
-            // we want self.unacked[nunacked..]
-            if h.len() >= nunacked as usize {
-                h = &h[nunacked as usize..];
-            } else {
-                let skipped = h.len();
-                h = &[];
-                t = &t[(nunacked as usize - skipped)..];
-            }
             self.write(nic, self.send.nxt, send as usize)?;
         }
         // if FIN, enter FIN-WAIT-1
@@ -492,10 +488,17 @@ impl Connection {
         if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
             if is_between_wrapped(self.send.una, ackn, self.send.nxt.wrapping_add(1)) {
                 if !self.unacked.is_empty() {
-                    let nacked = self
-                        .unacked
-                        .drain(..ackn.wrapping_sub(self.send.una) as usize)
-                        .count();
+                    let data_s = if self.send.una == self.send.iss {
+                        // send.una hasn't been updated yet with ACK for our SYN, so data starts
+                        // beyond it
+                        self.send.una.wrapping_add(1)
+                    } else {
+                        self.send.una
+                    };
+
+                    let acked_data_end =
+                        std::cmp::min(ackn.wrapping_sub(data_s) as usize, self.unacked.len());
+                    self.unacked.drain(..acked_data_end);
 
                     let old = std::mem::replace(&mut self.timers.send_times, BTreeMap::new());
 
@@ -515,37 +518,37 @@ impl Connection {
                 }
                 self.send.una = ackn;
             }
-            // TODO: prune self.unacked
             // TODO: if unacked empty and waiting flush, notify
             // TODO: update window
         }
         if let State::FinWait1 = self.state {
-            eprintln!("wait");
-            if self.send.una == self.send.iss + 2 {
-                eprintln!("wait1 if");
-                //our FIN has been ACKed
-                self.state = State::FinWait2;
+            if let Some(closed_at) = self.closed_at {
+                if self.send.una == closed_at.wrapping_add(1) {
+                    //our FIN has been ACKed
+                    self.state = State::FinWait2;
+                }
             }
         }
-        if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
-            let mut unread_data_at = (self.recv.nxt - seqn) as usize;
-            if unread_data_at > data.len() {
-                assert_eq!(unread_data_at, data.len() + 1);
-                unread_data_at = 0;
-            }
-            self.incoming.extend(&data[unread_data_at..]);
-            self.recv.nxt = seqn
-                .wrapping_add(data.len() as u32)
-                .wrapping_add(if tcph.fin() { 1 } else { 0 });
 
-            // TODO: mabye just tick topiggyback on data
-            self.write(nic, self.send.nxt, 0)?;
+        if !data.is_empty() {
+            if let State::Estab | State::FinWait1 | State::FinWait2 = self.state {
+                let mut unread_data_at = (self.recv.nxt - seqn) as usize;
+                if unread_data_at > data.len() {
+                    assert_eq!(unread_data_at, data.len() + 1);
+                    unread_data_at = 0;
+                }
+                self.incoming.extend(&data[unread_data_at..]);
+                self.recv.nxt = seqn.wrapping_add(data.len() as u32);
+
+                // TODO: mabye just tick topiggyback on data
+                self.write(nic, self.send.nxt, 0)?;
+            }
         }
 
         if tcph.fin() {
             match self.state {
                 State::FinWait2 => {
-                    eprintln!("wait2");
+                    self.recv.nxt = self.recv.nxt.wrapping_add(1);
                     // we're done with the connection!
                     self.write(nic, self.send.nxt, 0)?;
                     self.state = State::TimeWait;
