@@ -5,7 +5,6 @@ use std::{
 };
 
 use bitflags::bitflags;
-use nix::{sys::wait::WaitStatus, NixPath};
 
 bitflags! {
     pub(crate) struct Available: u8 {
@@ -140,12 +139,13 @@ impl Connection {
         tcph: etherparse::TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<Option<Self>> {
+        eprintln!("came to accept");
         if !tcph.syn() {
             // only SYN packet expected
             return Ok(None);
         }
         let iss = 0;
-        let wnd = 10;
+        let wnd = 1024;
         let mut c = Connection {
             timers: Timers {
                 send_times: Default::default(),
@@ -194,17 +194,20 @@ impl Connection {
 
         c.tcp.syn = true;
         c.tcp.ack = true;
-        c.write(nic, c.send.nxt, 0);
+        eprintln!("stuck here");
+        c.write(nic, c.send.nxt, 0)?;
 
         Ok(Some(c))
     }
 
     fn write(&mut self, nic: &mut tun_tap::Iface, seq: u32, mut limit: usize) -> io::Result<usize> {
         let mut buf = [0u8; 1500];
-        let (mut h, mut t) = self.unacked.as_slices();
+        eprintln!("arrive to write");
+        self.tcp.sequence_number = seq;
+        self.tcp.acknowledgment_number = self.recv.nxt;
         // TODO: return +1 for SYN/FIN
         // we need to special-case the two "virtual" bytes SYN and FIN
-        let mut offset = seq.wrapping_sub(self.send.una);
+        let mut offset = seq.wrapping_sub(self.send.una) as usize;
 
         //print!()
         if let Some(closed_at) = self.closed_at {
@@ -214,21 +217,21 @@ impl Connection {
                 limit = 0;
             }
         }
-        if h.len() >= offset as usize {
-            h = &h[offset as usize..];
+        let (mut h, mut t) = self.unacked.as_slices();
+        if h.len() >= offset {
+            h = &h[offset..];
         } else {
             let skipped = h.len();
             h = &[];
-            t = &t[(offset as usize - skipped)..];
+            eprintln!("{}", offset - skipped);
+            t = &t[(offset - skipped)..];
         }
         let max_data = std::cmp::min(limit, h.len() + t.len());
 
-        self.tcp.sequence_number = seq;
         let size = std::cmp::min(
             buf.len(),
             self.tcp.header_len() + self.ip.header_len() as usize + max_data,
         );
-        self.tcp.acknowledgment_number = self.recv.nxt;
         self.ip
             .set_payload_len(size - self.ip.header_len() as usize);
 
@@ -241,7 +244,6 @@ impl Connection {
         //calculate the tcp checksum
         unwritten = &mut unwritten[self.tcp.header_len() as usize..];
         let tcp_header_ends_at = bufl - unwritten.len();
-        self.tcp.write(&mut unwritten);
         let payload_bytes = {
             let mut written = 0;
             let mut limit = max_data;
@@ -256,14 +258,16 @@ impl Connection {
             written
         };
         let payloadh_ends_at = bufl - unwritten.len();
-        let unwritten = unwritten.len();
-        let next_seq = seq.wrapping_add(payload_bytes as u32);
 
         // had to calculate checksum, kernel does not do this(WTF?)
         self.tcp.checksum = self
             .tcp
             .calc_checksum_ipv4(&self.ip, &buf[tcp_header_ends_at..payloadh_ends_at])
             .expect("Failed");
+
+        let mut tcp_header_buf = &mut buf[ip_header_ends_at..tcp_header_ends_at];
+        self.tcp.write(&mut tcp_header_buf);
+        let next_seq = seq.wrapping_add(payload_bytes as u32);
         if self.tcp.syn {
             self.send.nxt = self.send.nxt.wrapping_add(1);
             self.tcp.syn = false;
@@ -279,7 +283,7 @@ impl Connection {
         }
 
         self.timers.send_times.insert(seq, time::Instant::now());
-        nic.send(&buf[..buf.len() - unwritten]);
+        nic.send(&buf[..payloadh_ends_at])?;
         Ok(payload_bytes)
     }
 
@@ -317,8 +321,6 @@ impl Connection {
             .wrapping_sub(self.send.una);
         let unsent = self.unacked.len() as u32 - nunacked;
 
-        self.closed;
-
         let waited_for = self
             .timers
             .send_times
@@ -341,6 +343,7 @@ impl Connection {
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32))
             }
 
+            eprintln!("on tick write");
             self.write(nic, self.send.una, resend as usize)?;
         } else {
             // we should send new data, and space in the window
@@ -354,11 +357,12 @@ impl Connection {
             }
 
             let send = std::cmp::min(unsent, allowed);
-            if send < allowed && self.closed && self.closed_at.is_some() {
+            if send < allowed && self.closed && self.closed_at.is_none() {
                 self.tcp.fin = true;
                 self.closed_at = Some(self.send.una.wrapping_add(self.unacked.len() as u32))
             }
 
+            eprintln!("mayber here on tick");
             self.write(nic, self.send.nxt, send as usize)?;
         }
         // if FIN, enter FIN-WAIT-1

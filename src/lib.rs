@@ -46,11 +46,6 @@ impl Drop for Interface {
     }
 }
 #[derive(Default)]
-struct Pending {
-    quads: VecDeque<Quad>,
-    var: Condvar,
-}
-#[derive(Default)]
 struct ConnectionManager {
     terminated: bool,
     connections: HashMap<Quad, tcp::Connection>,
@@ -103,6 +98,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                         };
                         match cm.connections.entry(q) {
                             Entry::Occupied(mut c) => {
+                                eprintln!("got occ");
                                 let a = c.get_mut().on_packet(
                                     &mut nic,
                                     iph,
@@ -122,6 +118,7 @@ fn packet_loop(mut nic: tun_tap::Iface, ih: InterfaceHandle) -> io::Result<()> {
                             Entry::Vacant(e) => {
                                 if let Some(pending) = cm.pending.get_mut(&tcph.destination_port())
                                 {
+                                    eprintln!("got vacant");
                                     if let Some(c) = tcp::Connection::accept(
                                         &mut nic,
                                         iph,
@@ -190,6 +187,7 @@ pub struct TcpStream {
 
 impl Read for TcpStream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        eprintln!("got to read");
         let mut cm = self.h.manager.lock().unwrap();
         loop {
             let c = cm.connections.get_mut(&self.quad).ok_or_else(|| {
@@ -258,13 +256,13 @@ impl Write for TcpStream {
         })?;
 
         if c.unacked.is_empty() {
-            return Ok(());
+            Ok(())
         } else {
             // TODO: block
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "too many bytes buffered",
-            ));
+            ))
         }
     }
 }
@@ -317,9 +315,9 @@ impl TcpListener {
                     quad,
                     h: self.h.clone(),
                 });
-            } else {
-                cm = self.h.pending_var.wait(cm).unwrap();
             }
+
+            cm = self.h.pending_var.wait(cm).unwrap();
         }
     }
 }
